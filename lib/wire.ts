@@ -260,6 +260,11 @@ async function* streamData(body: ReadableStream<Uint8Array> | null): AsyncGenera
   }
 }
 
+function carriesOutput(delta: unknown): boolean {
+  return isObject(delta) && Boolean(textOf(delta.content) || delta.refusal || delta.function_call ||
+    (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0));
+}
+
 async function readEvents(response: Response, request: Json, onChunk: (chunk: Json) => void | Promise<void>) {
   let latestUsage: unknown;
   let finish: Json | undefined;
@@ -274,18 +279,25 @@ async function readEvents(response: Response, request: Json, onChunk: (chunk: Js
     if (done) throw new Error('Upstream events followed the stream terminator');
     const chunk = object(JSON.parse(data));
     if (isObject(chunk.error)) throw new CompletionRefusal(chunk.error);
+    if (chunk.choices == null && isObject(chunk.usage)) chunk.choices = [];
     const [choice] = objects(chunk.choices);
     if (choice?.finish_reason === 'error') throw new Error('The upstream stream failed');
     if (chunk.usage != null) latestUsage = chunk.usage;
     if (isObject(choice?.delta)) {
       const part = textOf(choice.delta.content);
-      if (finish && part) throw new Error('Upstream content followed the finish reason');
+      if (finish && carriesOutput(choice.delta)) throw new Error('Upstream content followed the finish reason');
+      if (Array.isArray(choice.delta.content)) choice.delta.content = part;
       if (isObject(request.response_format)) text += part;
     }
     if (choice?.finish_reason != null) {
-      if (finish) throw new Error('The upstream sent multiple finish reasons');
-      reason = checkStop(choice.finish_reason);
-      finish = choice;
+      const stop = checkStop(choice.finish_reason);
+      if (!finish) {
+        reason = stop;
+        finish = choice;
+      } else if (stop === reason) {
+        // An accounting frame can repeat the already delivered finish reason.
+        chunk.choices = [];
+      } else throw new Error('The upstream sent conflicting finish reasons');
     }
     await onChunk(chunk);
   }
@@ -359,6 +371,51 @@ export function jsonCompletion(raw: string, wire: Wire, request: Json, model: st
   return asJson(raw, wire, request, model);
 }
 
+function* completionChunks(answer: Json): Generator<string> {
+  const { choices, usage, ...metadata } = answer;
+  const [choice] = objects(choices);
+  const { role, tool_calls, ...content } = object(choice.message);
+  const index = choice.index ?? 0;
+  const base = { ...metadata, object: 'chat.completion.chunk' };
+  const delta: Json = { ...content };
+  if (Array.isArray(delta.content)) delta.content = textOf(delta.content);
+  if (Array.isArray(tool_calls)) {
+    delta.tool_calls = objects(tool_calls).map((tool, index) => ({ ...tool, index }));
+  }
+  const frame = (chunk: Json) => `data: ${JSON.stringify({ ...base, ...chunk })}\n\n`;
+  yield frame({ choices: [{ index, delta: { role }, finish_reason: null }] });
+  if (Object.keys(delta).length) yield frame({ choices: [{ index, delta, finish_reason: null }] });
+  yield frame({ choices: [{ index, delta: {}, finish_reason: choice.finish_reason }] });
+  yield frame({ choices: [], usage });
+  yield 'data: [DONE]\n\n';
+}
+
+function* messageEvents(answer: Json): Generator<string> {
+  const { content, stop_reason, stop_sequence, usage: rawUsage, ...head } = answer;
+  const usage = object(rawUsage);
+  yield event('message_start', { message: {
+    ...head, content: [], stop_reason: null, stop_sequence: null,
+    usage: { input_tokens: usage.input_tokens, output_tokens: 0 },
+  } });
+  for (const [index, block] of objects(content).entries()) {
+    if (block.type === 'text') {
+      yield event('content_block_start', { index, content_block: { type: 'text', text: '' } });
+      yield event('content_block_delta', { index, delta: { type: 'text_delta', text: block.text } });
+    } else {
+      const { input, ...tool } = block;
+      yield event('content_block_start', { index, content_block: { ...tool, input: {} } });
+      yield event('content_block_delta', { index, delta: { type: 'input_json_delta', partial_json: JSON.stringify(input) } });
+    }
+    yield event('content_block_stop', { index });
+  }
+  yield event('message_delta', { delta: { stop_reason, stop_sequence }, usage: { output_tokens: usage.output_tokens } });
+  yield event('message_stop');
+}
+
+export function completionEvents(answer: Json, wire: Wire): Generator<string> {
+  return wire === 'openai' ? completionChunks(answer) : messageEvents(answer);
+}
+
 export async function messagesStream(upstream: Response, request: Json, model: string): Promise<string> {
   // OpenRouter sends usage at the end. Hold it for the Messages message_start and message_delta.
   const chunks: Json[] = [];
@@ -375,9 +432,7 @@ export async function chatStream(
     const frame = `data: ${JSON.stringify({ ...chunk, model })}\n\n`;
     if (!hasOutput) {
       const [choice] = objects(chunk.choices);
-      const delta = choice?.delta;
-      hasOutput = isObject(delta) && Boolean(textOf(delta.content) || delta.refusal || delta.function_call ||
-        (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0));
+      hasOutput = carriesOutput(choice?.delta);
       if (!hasOutput) {
         leading.push(frame);
         return;

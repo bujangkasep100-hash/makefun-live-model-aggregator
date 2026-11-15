@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { catalogOf, INKLING_MODEL, isObject, listModels, loadModels, Router, type Json, type Wire } from './lib/catalog.ts';
-import { chatStream, CompletionRefusal, jsonCompletion, messagesStream, RESPONSE_BYTES, toChatRequest } from './lib/wire.ts';
+import { chatStream, completionEvents, CompletionRefusal, jsonCompletion, messagesStream, RESPONSE_BYTES, toChatRequest } from './lib/wire.ts';
 
 const REQUEST_BYTES = 8 * 1024 * 1024;
 const MAX_ATTEMPTS = 8;
@@ -104,8 +104,12 @@ function addTrail(res: ServerResponse, failures: Failure[]): void {
   if (failures.length) res.setHeader('x-makefun-upstream-failures', JSON.stringify(failures));
 }
 
-function gatewayRequest(body: Json, model: string): Json {
+function gatewayRequest(body: Json, model: string, stream: boolean): Json {
   const request: Json = { ...body, model };
+  if (!stream) {
+    delete request.stream;
+    delete request.stream_options;
+  }
   if (body.reasoning === undefined && body.reasoning_effort === undefined) {
     // Reserve the visible output budget using each model's supported control.
     if (model === INKLING_MODEL) request.reasoning_effort = 'none';
@@ -115,19 +119,28 @@ function gatewayRequest(body: Json, model: string): Json {
 }
 
 async function sendCompletion(
-  res: ServerResponse, upstream: Response, wire: Wire, request: Json, model: string, signal: AbortSignal,
+  res: ServerResponse, upstream: Response, wire: Wire, request: Json, model: string,
+  upstreamStream: boolean, signal: AbortSignal,
 ): Promise<void> {
-  if (request.stream !== true) {
-    json(res, 200, jsonCompletion(await upstreamBody(upstream), wire, request, model));
+  const send = async (frame: string) => {
+    if (!res.headersSent) res.writeHead(200, SSE_HEADERS);
+    if (!res.write(frame)) await once(res, 'drain', { signal });
+  };
+  const type = upstream.headers.get('content-type') ?? '';
+  if (!upstreamStream || /(?:\/|\+)json(?:\s*;|$)/i.test(type)) {
+    const answer = jsonCompletion(await upstreamBody(upstream), wire, request, model);
+    if (request.stream !== true) {
+      json(res, 200, answer);
+      return;
+    }
+    for (const frame of completionEvents(answer, wire)) await send(frame);
+    res.end();
   } else if (wire === 'anthropic') {
     const events = await messagesStream(upstream, request, model);
     res.writeHead(200, SSE_HEADERS);
     res.end(events);
   } else {
-    await chatStream(upstream, request, model, async (frame) => {
-      if (!res.headersSent) res.writeHead(200, SSE_HEADERS);
-      if (!res.write(frame)) await once(res, 'drain', { signal });
-    });
+    await chatStream(upstream, request, model, send);
     res.end();
   }
 }
@@ -147,17 +160,19 @@ async function complete(res: ServerResponse, wire: Wire, body: Json): Promise<vo
   try {
     let last;
     for (const { id } of candidates.slice(0, MAX_ATTEMPTS)) {
+      // Use Nemotron's verified JSON completion to build SSE with its full usage and stop reason.
+      const upstreamStream = body.stream === true && id !== NEMOTRON_VL;
       const upstream = await fetch(chatUrl, {
         method: 'POST',
         headers: { authorization: `Bearer ${gatewayKey}`, 'content-type': 'application/json' },
-        body: JSON.stringify(gatewayRequest(body, id)),
+        body: JSON.stringify(gatewayRequest(body, id, upstreamStream)),
         redirect: 'error',
         signal,
       });
       if (upstream.ok) {
         addTrail(res, failures);
         try {
-          await sendCompletion(res, upstream, wire, body, id, signal);
+          await sendCompletion(res, upstream, wire, body, id, upstreamStream, signal);
           router.succeeded(id, sequence);
           return;
         } catch (error) {

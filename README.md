@@ -8,6 +8,8 @@ One Node.js 22 server exposes OpenAI Chat Completions and Anthropic Messages ove
 
 Send `model: "auto"` to rank eligible models by live availability and the brief's quality ratings. Use a model ID from `/v1/models` to pin a request. The relay forwards the client's output cap, system instructions, tools and JSON format. A retryable refusal can move an `auto` request to another model. The response reports the actual model and any earlier gateway refusals.
 
+For Nemotron 3.5 Super VL, the relay emits SSE events after it receives the gateway's complete JSON response. The events carry the original content, usage, tool calls and stop reason.
+
 ## Run it
 
 From the unpacked Make.fun kit, run the practice grade with Node.js 22. Set `ENTRY_REPO` to this repository's absolute path. `OPENROUTER_ENV_FILE` names a private env file outside the repository containing `OPENROUTER_API_KEY`.
