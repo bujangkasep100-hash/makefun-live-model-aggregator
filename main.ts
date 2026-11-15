@@ -129,11 +129,12 @@ async function complete(res: ServerResponse, wire: Wire, body: Json): Promise<vo
           });
           res.end();
         }
-        router.succeeded(id);
+        router.succeeded(id, sequence);
         return;
       }
 
-      last = refusal(upstream.status, await upstreamBody(upstream));
+      const diagnostic = await upstreamBody(upstream).catch(() => '');
+      last = refusal(upstream.status, diagnostic);
       failures.push({ status: last.status, code: last.code, model: id });
       if (!last.retry) break;
       router.refused(id, sequence, last.status);

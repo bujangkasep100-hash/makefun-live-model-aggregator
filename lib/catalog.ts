@@ -77,7 +77,7 @@ export function listModels(models: Model[], wire: Wire): Json {
 
 export class Router {
   private ranked: Model[];
-  private cooldown = new Map<string, { until: number; failures: number }>();
+  private health = new Map<string, { sequence: number; until: number; failures: number }>();
   private sequence = 0;
 
   constructor(models: Model[]) {
@@ -100,20 +100,24 @@ export class Router {
     const ready: Model[] = [];
     const cooling: Model[] = [];
     for (const model of eligible) {
-      const until = this.cooldown.get(model.id)?.until ?? 0;
+      const until = this.health.get(model.id)?.until ?? 0;
       (sequence < until ? cooling : ready).push(model);
     }
     return { sequence, candidates: ready.concat(cooling) };
   }
 
   refused(id: string, sequence: number, status: number): void {
-    const failures = (this.cooldown.get(id)?.failures ?? 0) + 1;
+    const previous = this.health.get(id);
+    if (previous && previous.sequence > sequence) return;
+    const failures = (previous?.failures ?? 0) + 1;
     // A single 5xx may clear immediately. After a 429 or repeated failures, skip a few requests.
     const wait = status === 429 || status === 404 || failures > 1 ? Math.min(failures, 3) : 0;
-    this.cooldown.set(id, { failures, until: sequence + wait + 1 });
+    this.health.set(id, { sequence, failures, until: sequence + wait + 1 });
   }
 
-  succeeded(id: string): void {
-    this.cooldown.delete(id);
+  succeeded(id: string, sequence: number): void {
+    const previous = this.health.get(id);
+    if (previous && previous.sequence > sequence) return;
+    this.health.set(id, { sequence, until: 0, failures: 0 });
   }
 }
