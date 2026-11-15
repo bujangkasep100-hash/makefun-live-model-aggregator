@@ -223,7 +223,7 @@ async function* streamData(body: ReadableStream<Uint8Array> | null): AsyncGenera
       const { value, done } = await reader.read();
       bytes += value?.byteLength ?? 0;
       if (bytes > RESPONSE_BYTES) throw new Error('The upstream stream is too large');
-      let chunk = (trailingCR ? '\r' : '') + decoder.decode(value, { stream: !done });
+      let chunk: string = (trailingCR ? '\r' : '') + decoder.decode(value, { stream: !done });
       trailingCR = !done && chunk.endsWith('\r');
       if (trailingCR) chunk = chunk.slice(0, -1);
       buffer += chunk.replace(/\r\n?/g, '\n');
