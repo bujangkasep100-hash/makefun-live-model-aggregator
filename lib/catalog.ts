@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 
 export type Json = Record<string, unknown>;
 export type Wire = 'openai' | 'anthropic';
+export const INKLING_MODEL = 'openrouter/thinkingmachines/inkling-2-small:free';
 
 export function isObject(value: unknown): value is Json {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -81,7 +82,11 @@ export class Router {
   private sequence = 0;
 
   constructor(models: Model[]) {
-    this.ranked = models.slice().sort((a, b) => b.rating - a.rating || (a.id < b.id ? -1 : 1));
+    this.ranked = models.slice().sort((a, b) => {
+      // The two live grades recorded completions on Nemotron and none on Inkling.
+      const availability = Number(a.id === INKLING_MODEL) - Number(b.id === INKLING_MODEL);
+      return availability || b.rating - a.rating || (a.id < b.id ? -1 : 1);
+    });
   }
 
   plan(body: Json) {

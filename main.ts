@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
-import { catalogOf, isObject, listModels, loadModels, Router, type Json, type Wire } from './lib/catalog.ts';
+import { catalogOf, INKLING_MODEL, isObject, listModels, loadModels, Router, type Json, type Wire } from './lib/catalog.ts';
 import { chatStream, CompletionRefusal, jsonCompletion, messagesStream, RESPONSE_BYTES, toChatRequest } from './lib/wire.ts';
 
 const REQUEST_BYTES = 8 * 1024 * 1024;
@@ -9,7 +9,6 @@ const MAX_ATTEMPTS = 8;
 const TERMINAL_CODES = new Set(['budget_exhausted', 'request_cap']);
 const KEY_CODES = new Set(['invalid_api_key', 'missing_api_key', 'authentication_error', 'insufficient_credits']);
 const SSE_HEADERS = { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache' };
-const INKLING = 'openrouter/thinkingmachines/inkling-2-small:free';
 const NEMOTRON_VL = 'openrouter/nvidia/nemotron-3.5-super-vl:free';
 
 const models = loadModels(process.env.MAKEFUN_PROMPT_FILE);
@@ -109,7 +108,7 @@ function gatewayRequest(body: Json, model: string): Json {
   const request: Json = { ...body, model };
   if (body.reasoning === undefined && body.reasoning_effort === undefined) {
     // Reserve the visible output budget using each model's supported control.
-    if (model === INKLING) request.reasoning_effort = 'none';
+    if (model === INKLING_MODEL) request.reasoning_effort = 'none';
     if (model === NEMOTRON_VL) request.reasoning = { enabled: false };
   }
   return request;

@@ -6,7 +6,7 @@
 
 One Node.js 22 server exposes OpenAI Chat Completions and Anthropic Messages over Make.fun's OpenRouter gateway. Both APIs support JSON replies and server-sent events. The two model-list formats and the trial registration share the free catalog from the trial brief.
 
-Send `model: "auto"` to rank eligible models by the brief's quality ratings, or use a model ID from `/v1/models` to pin a request. The relay forwards the client's output cap, system instructions, tools and JSON format. A retryable refusal can move an `auto` request to another model. The response reports the actual model and any earlier gateway refusals.
+Send `model: "auto"` to rank eligible models by live availability and the brief's quality ratings. Use a model ID from `/v1/models` to pin a request. The relay forwards the client's output cap, system instructions, tools and JSON format. A retryable refusal can move an `auto` request to another model. The response reports the actual model and any earlier gateway refusals.
 
 ## Run it
 
