@@ -6,7 +6,24 @@ const CHAT_FIELDS = [
   'reasoning', 'reasoning_effort',
 ];
 const STOP_REASONS = new Set(['stop', 'length', 'tool_calls', 'function_call', 'content_filter']);
+const ERROR_STATUSES: Record<string, number> = {
+  invalid_request_error: 400, authentication_error: 401, permission_error: 403,
+  not_found_error: 404, rate_limit_error: 429, api_error: 502, overloaded_error: 503,
+};
 export const RESPONSE_BYTES = 2 * 1024 * 1024;
+
+export class CompletionRefusal extends Error {
+  readonly status: number;
+  readonly body: string;
+
+  constructor(error: Json) {
+    super('The upstream reported a completion error');
+    const code = typeof error.code === 'number' || typeof error.code === 'string' ? Number(error.code) : NaN;
+    const type = typeof error.type === 'string' && Object.hasOwn(ERROR_STATUSES, error.type) ? ERROR_STATUSES[error.type] : 502;
+    this.status = Number.isInteger(code) && code >= 400 && code <= 599 ? code : type;
+    this.body = JSON.stringify({ error });
+  }
+}
 
 function object(value: unknown): Json {
   if (!isObject(value)) throw new Error('Expected an object');
@@ -117,10 +134,6 @@ export function toChatRequest(body: Json, wire: Wire): Json {
   if (isObject(request.response_format) && request.response_format.type !== 'text') {
     request.provider = { require_parameters: true };
   }
-  if (request.reasoning === undefined && request.reasoning_effort === undefined) {
-    // Use the client's output budget for visible output unless they ask for reasoning.
-    request.reasoning = { enabled: false };
-  }
   if (body.stream === true) {
     request.stream = true;
     request.stream_options = { include_usage: true };
@@ -183,6 +196,7 @@ function checkFormat(request: Json, text: string, reason: string): void {
 
 function asJson(raw: string, wire: Wire, request: Json, model: string): Json {
   const answer = object(JSON.parse(raw));
+  if (isObject(answer.error)) throw new CompletionRefusal(answer.error);
   const choice = objects(answer.choices)[0];
   const message = object(choice?.message);
   const usage = usageOf(answer.usage);
@@ -259,8 +273,9 @@ async function readEvents(response: Response, request: Json, onChunk: (chunk: Js
     }
     if (done) throw new Error('Upstream events followed the stream terminator');
     const chunk = object(JSON.parse(data));
+    if (isObject(chunk.error)) throw new CompletionRefusal(chunk.error);
     const [choice] = objects(chunk.choices);
-    if (chunk.error || choice?.finish_reason === 'error') throw new Error('The upstream stream failed');
+    if (choice?.finish_reason === 'error') throw new Error('The upstream stream failed');
     if (chunk.usage != null) latestUsage = chunk.usage;
     if (isObject(choice?.delta)) {
       const part = textOf(choice.delta.content);
@@ -354,6 +369,24 @@ export async function messagesStream(upstream: Response, request: Json, model: s
 export async function chatStream(
   upstream: Response, request: Json, model: string, send: (frame: string) => Promise<void>,
 ): Promise<void> {
-  await readEvents(upstream, request, (chunk) => send(`data: ${JSON.stringify({ ...chunk, model })}\n\n`));
+  const leading: string[] = [];
+  let hasOutput = false;
+  await readEvents(upstream, request, async (chunk) => {
+    const frame = `data: ${JSON.stringify({ ...chunk, model })}\n\n`;
+    if (!hasOutput) {
+      const [choice] = objects(chunk.choices);
+      const delta = choice?.delta;
+      hasOutput = isObject(delta) && Boolean(textOf(delta.content) || delta.refusal || delta.function_call ||
+        (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0));
+      if (!hasOutput) {
+        leading.push(frame);
+        return;
+      }
+      for (const line of leading) await send(line);
+      leading.length = 0;
+    }
+    await send(frame);
+  });
+  for (const line of leading) await send(line);
   await send('data: [DONE]\n\n');
 }

@@ -110,8 +110,9 @@ export class Router {
     const previous = this.health.get(id);
     if (previous && previous.sequence > sequence) return;
     const failures = (previous?.failures ?? 0) + 1;
-    // A single 5xx may clear immediately. After a 429 or repeated failures, skip a few requests.
-    const wait = status === 429 || status === 404 || failures > 1 ? Math.min(failures, 3) : 0;
+    // A single timeout or 5xx may clear immediately. Other refusals get a short cooldown.
+    const recurring = (status < 500 && status !== 408) || failures > 1;
+    const wait = recurring ? Math.min(failures, 3) : 0;
     this.health.set(id, { sequence, failures, until: sequence + wait + 1 });
   }
 

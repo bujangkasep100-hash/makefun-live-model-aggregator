@@ -2,12 +2,15 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { catalogOf, isObject, listModels, loadModels, Router, type Json, type Wire } from './lib/catalog.ts';
-import { chatStream, jsonCompletion, messagesStream, RESPONSE_BYTES, toChatRequest } from './lib/wire.ts';
+import { chatStream, CompletionRefusal, jsonCompletion, messagesStream, RESPONSE_BYTES, toChatRequest } from './lib/wire.ts';
 
 const REQUEST_BYTES = 8 * 1024 * 1024;
 const MAX_ATTEMPTS = 8;
 const TERMINAL_CODES = new Set(['budget_exhausted', 'request_cap']);
+const KEY_CODES = new Set(['invalid_api_key', 'missing_api_key', 'authentication_error', 'insufficient_credits']);
 const SSE_HEADERS = { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache' };
+const INKLING = 'openrouter/thinkingmachines/inkling-2-small:free';
+const NEMOTRON_VL = 'openrouter/nvidia/nemotron-3.5-super-vl:free';
 
 const models = loadModels(process.env.MAKEFUN_PROMPT_FILE);
 const catalog = catalogOf(models);
@@ -72,6 +75,7 @@ async function upstreamBody(response: Response): Promise<string> {
 function refusal(status: number, raw: string) {
   let code = `http_${status}`;
   let message = `The model gateway answered HTTP ${status}`;
+  let namedProvider = false;
   try {
     const body = JSON.parse(raw);
     const error = isObject(body.error) ? body.error : body;
@@ -80,15 +84,53 @@ function refusal(status: number, raw: string) {
       code = String(tag);
     }
     if (typeof error.message === 'string' && error.message) message = error.message.slice(0, 800);
+    namedProvider = isObject(error.metadata) && typeof error.metadata.provider_name === 'string';
   } catch {
     // Some upstream errors are HTML or plain text. The status still determines whether to retry.
   }
-  const retry = !TERMINAL_CODES.has(code) && (status === 404 || status === 408 || status === 429 || status >= 500);
+  const modelRefusal = (status === 400 || status === 422) && (
+    namedProvider || code === 'model_not_allowed' ||
+    /provider returned (?:an? )?error|not a valid model|unsupported (?:model|parameter)/i.test(message)
+  );
+  const modelScope = namedProvider || (/\bmodel\b/i.test(message) &&
+    /not (?:allowed|available|permitted)|access|permission|entitlement|forbidden|denied/i.test(message));
+  const policyOrKeyRefusal = /moderation|guardrail|content.?filter|safety|data policy|(?:invalid|missing|expired|revoked)\s+(?:api )?key/i.test(`${code} ${message}`);
+  const modelAccessRefusal = [401, 402, 403].includes(status) && modelScope && !policyOrKeyRefusal;
+  const retry = !TERMINAL_CODES.has(code) && !KEY_CODES.has(code) && !policyOrKeyRefusal &&
+    (modelRefusal || modelAccessRefusal || status === 404 || status === 408 || status === 429 || status >= 500);
   return { status, code, message, retry };
 }
 
 function addTrail(res: ServerResponse, failures: Failure[]): void {
   if (failures.length) res.setHeader('x-makefun-upstream-failures', JSON.stringify(failures));
+}
+
+function gatewayRequest(body: Json, model: string): Json {
+  const request: Json = { ...body, model };
+  if (body.reasoning === undefined && body.reasoning_effort === undefined) {
+    // Reserve the visible output budget using each model's supported control.
+    if (model === INKLING) request.reasoning_effort = 'none';
+    if (model === NEMOTRON_VL) request.reasoning = { enabled: false };
+  }
+  return request;
+}
+
+async function sendCompletion(
+  res: ServerResponse, upstream: Response, wire: Wire, request: Json, model: string, signal: AbortSignal,
+): Promise<void> {
+  if (request.stream !== true) {
+    json(res, 200, jsonCompletion(await upstreamBody(upstream), wire, request, model));
+  } else if (wire === 'anthropic') {
+    const events = await messagesStream(upstream, request, model);
+    res.writeHead(200, SSE_HEADERS);
+    res.end(events);
+  } else {
+    await chatStream(upstream, request, model, async (frame) => {
+      if (!res.headersSent) res.writeHead(200, SSE_HEADERS);
+      if (!res.write(frame)) await once(res, 'drain', { signal });
+    });
+    res.end();
+  }
 }
 
 async function complete(res: ServerResponse, wire: Wire, body: Json): Promise<void> {
@@ -109,32 +151,25 @@ async function complete(res: ServerResponse, wire: Wire, body: Json): Promise<vo
       const upstream = await fetch(chatUrl, {
         method: 'POST',
         headers: { authorization: `Bearer ${gatewayKey}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ ...body, model: id }),
+        body: JSON.stringify(gatewayRequest(body, id)),
         redirect: 'error',
         signal,
       });
       if (upstream.ok) {
-        // An admitted completion owns the response, including any failure during its stream.
         addTrail(res, failures);
-        if (body.stream !== true) {
-          json(res, 200, jsonCompletion(await upstreamBody(upstream), wire, body, id));
-        } else if (wire === 'anthropic') {
-          const events = await messagesStream(upstream, body, id);
-          res.writeHead(200, SSE_HEADERS);
-          res.end(events);
-        } else {
-          await chatStream(upstream, body, id, async (frame) => {
-            if (!res.headersSent) res.writeHead(200, SSE_HEADERS);
-            if (!res.write(frame)) await once(res, 'drain', { signal });
-          });
-          res.end();
+        try {
+          await sendCompletion(res, upstream, wire, body, id, signal);
+          router.succeeded(id, sequence);
+          return;
+        } catch (error) {
+          // An explicit error inside a 200 body can be retried before anything reaches the client.
+          if (!(error instanceof CompletionRefusal) || res.headersSent) throw error;
+          last = refusal(error.status, error.body);
         }
-        router.succeeded(id, sequence);
-        return;
+      } else {
+        const diagnostic = await upstreamBody(upstream).catch(() => '');
+        last = refusal(upstream.status, diagnostic);
       }
-
-      const diagnostic = await upstreamBody(upstream).catch(() => '');
-      last = refusal(upstream.status, diagnostic);
       failures.push({ status: last.status, code: last.code, model: id });
       if (!last.retry) break;
       router.refused(id, sequence, last.status);
